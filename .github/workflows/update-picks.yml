@@ -1,0 +1,42 @@
+name: Update Daily Research Picks
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 12:10 UTC is 8:10 AM Eastern during daylight saving time.
+    # Adjust the cron if you want a different pre-market or after-close pull.
+    - cron: "10 12 * * 1-5"
+
+permissions:
+  contents: write
+
+jobs:
+  update-picks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate real daily research snapshot
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
+          TRADE_TICKERS: ${{ vars.TRADE_TICKERS }}
+        run: python scripts/update_picks.py
+
+      - name: Commit generated data
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: update daily stock research snapshot"
+          file_pattern: data/latest-picks.json
+
+      - name: Trigger Netlify deploy hook
+        if: ${{ secrets.NETLIFY_BUILD_HOOK_URL != '' }}
+        env:
+          NETLIFY_BUILD_HOOK_URL: ${{ secrets.NETLIFY_BUILD_HOOK_URL }}
+        run: curl -X POST "$NETLIFY_BUILD_HOOK_URL"

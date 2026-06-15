@@ -1,0 +1,300 @@
+import latestSnapshot from "@/data/latest-picks.json";
+import type { InfluenceFactor, PicksSnapshot, TradePick } from "@/types/market";
+import { getUniverseFromEnv } from "@/lib/market/config";
+import {
+  buildTradeLevels,
+  calculateRsi,
+  catalystTagsFromText,
+  keywordSentimentScore,
+  riskFromScore,
+  scoreDirection,
+  scoreMomentum,
+  scoreRelativeVolume,
+  scoreRsi,
+  weightedOverall,
+  weightForFactor
+} from "@/lib/market/scoring";
+import { alphaSentimentToScore, getAlphaNewsSentiment, hasAlphaVantageKey } from "@/lib/market/providers/alpha-vantage";
+import { getFmpHistorical, getFmpNews, getFmpProfile, getFmpQuote, hasFmpKey } from "@/lib/market/providers/fmp";
+import { robinhoodStockUrl } from "@/lib/utils";
+
+const typedFallback = latestSnapshot as PicksSnapshot;
+
+type BuildPickResult = {
+  pick?: TradePick;
+  error?: string;
+};
+
+export async function getDailyResearchPicks(refresh = false): Promise<PicksSnapshot> {
+  const universe = getUniverseFromEnv();
+
+  if (!hasFmpKey()) {
+    return {
+      ...typedFallback,
+      dataStatus: "fallback",
+      dataDelayNote:
+        "Fallback sample shown because FMP_API_KEY is missing. Add .env.local and Netlify environment variables to pull real daily data.",
+      providerNote: "No server-side market API key detected. This is not live data."
+    };
+  }
+
+  const results = await Promise.all(universe.map((ticker) => buildPick(ticker, refresh)));
+  const picks = results
+    .filter((result): result is { pick: TradePick } => Boolean(result.pick))
+    .map((result) => result.pick)
+    .sort((a, b) => b.overallScore - a.overallScore)
+    .slice(0, 5)
+    .map((pick, index) => ({ ...pick, rank: index + 1 }));
+
+  const errors = results.map((result) => result.error).filter(Boolean) as string[];
+
+  if (!picks.length) {
+    return {
+      ...typedFallback,
+      dataStatus: "error",
+      dataDelayNote: "Live provider calls failed; fallback sample data is displayed.",
+      providerNote: "Check API keys, endpoint access, and provider limits.",
+      errors
+    };
+  }
+
+  return {
+    asOf: new Date().toISOString(),
+    marketSession: marketSessionLabel(),
+    dataStatus: "live",
+    dataDelayNote:
+      "Server-side API data loaded. Depending on your data plan, quotes may be real-time, near real-time, or delayed by the provider.",
+    providerNote: hasAlphaVantageKey()
+      ? "Using FMP for quote/history/profile/news and Alpha Vantage for optional news sentiment overlay."
+      : "Using FMP for quote/history/profile/news. Add ALPHA_VANTAGE_API_KEY for an external sentiment overlay.",
+    universe,
+    picks,
+    errors
+  };
+}
+
+async function buildPick(ticker: string, _refresh: boolean): Promise<BuildPickResult> {
+  try {
+    const [quote, profile, historical, news] = await Promise.all([
+      getFmpQuote(ticker),
+      getFmpProfile(ticker).catch(() => undefined),
+      getFmpHistorical(ticker, 60).catch(() => []),
+      getFmpNews(ticker).catch(() => [])
+    ]);
+
+    if (!quote?.price) return { error: `${ticker}: missing live quote price` };
+
+    const orderedHistorical = [...historical]
+      .filter((bar) => typeof bar.close === "number" || typeof bar.price === "number")
+      .sort((a, b) => a.date.localeCompare(b.date));
+    const closes = orderedHistorical.map((bar) => Number(bar.close ?? bar.price)).filter(Number.isFinite);
+    const rsi14 = calculateRsi(closes);
+
+    const newsText = news.map((item) => `${item.title ?? ""} ${item.text ?? ""}`);
+    let sentimentScore = keywordSentimentScore(newsText);
+    const alphaResponse = hasAlphaVantageKey() ? await getAlphaNewsSentiment(ticker).catch(() => undefined) : undefined;
+    const alphaScore = alphaSentimentToScore(ticker, alphaResponse);
+    if (alphaScore !== undefined) {
+      sentimentScore = Math.round((sentimentScore + alphaScore) / 2);
+    }
+
+    const price = Number(quote.price);
+    const changePercent = Number(quote.changePercentage ?? quote.changesPercentage ?? 0);
+    const avgVolume = Number(quote.avgVolume ?? averageVolume(orderedHistorical));
+    const volume = Number(quote.volume ?? orderedHistorical.at(-1)?.volume ?? 0);
+    const relativeVolume = avgVolume > 0 ? Number((volume / avgVolume).toFixed(2)) : undefined;
+    const technicalScore = scoreRsi(rsi14);
+    const momentumScore = scoreMomentum(changePercent);
+    const volumeScore = scoreRelativeVolume(relativeVolume);
+    const operationsScore = scoreOperations(newsText);
+
+    const factors: InfluenceFactor[] = [
+      {
+        name: "News sentiment",
+        value: `${sentimentScore}/100`,
+        score: sentimentScore,
+        weight: weightForFactor("newsSentiment"),
+        direction: scoreDirection(sentimentScore),
+        reason:
+          alphaScore !== undefined
+            ? "Headline keyword tone blended with Alpha Vantage ticker sentiment."
+            : "Headline keyword tone from recent stock-specific news because Alpha Vantage key is not enabled.",
+        source: alphaScore !== undefined ? "FMP news + Alpha Vantage NEWS_SENTIMENT" : "FMP news"
+      },
+      {
+        name: "Technical setup",
+        value: rsi14 ? `RSI ${rsi14.toFixed(1)}` : "RSI unavailable",
+        score: technicalScore,
+        weight: weightForFactor("technicals"),
+        direction: scoreDirection(technicalScore),
+        reason: technicalReason(rsi14),
+        source: "FMP historical price bars"
+      },
+      {
+        name: "Volume pressure",
+        value: relativeVolume ? `${relativeVolume}x average` : "Volume unavailable",
+        score: volumeScore,
+        weight: weightForFactor("volume"),
+        direction: scoreDirection(volumeScore),
+        reason: volumeReason(relativeVolume),
+        source: "FMP quote + historical volume"
+      },
+      {
+        name: "Price momentum",
+        value: `${changePercent.toFixed(2)}% today`,
+        score: momentumScore,
+        weight: weightForFactor("momentum"),
+        direction: scoreDirection(momentumScore),
+        reason: momentumReason(changePercent),
+        source: "FMP quote"
+      },
+      {
+        name: "Operations/news catalyst",
+        value: catalystTagsFromText(newsText).join(", ") || "No clear catalyst",
+        score: operationsScore,
+        weight: weightForFactor("operations"),
+        direction: scoreDirection(operationsScore),
+        reason: operationsReason(operationsScore),
+        source: "FMP stock news"
+      }
+    ];
+
+    const overallScore = weightedOverall(factors);
+    const levels = buildTradeLevels(price, quote.dayLow, quote.dayHigh);
+    const riskLevel = riskFromScore(overallScore, price, relativeVolume);
+    const tags = catalystTagsFromText(newsText);
+
+    const pick: TradePick = {
+      rank: 999,
+      ticker,
+      companyName: profile?.companyName ?? quote.name ?? ticker,
+      sector: profile?.sector ?? profile?.industry ?? "Market",
+      price,
+      changePercent,
+      dayHigh: quote.dayHigh,
+      dayLow: quote.dayLow,
+      open: quote.open,
+      previousClose: quote.previousClose,
+      volume,
+      avgVolume,
+      relativeVolume,
+      rsi14,
+      vwap: orderedHistorical.at(-1)?.vwap,
+      sentimentScore,
+      momentumScore,
+      volumeScore,
+      technicalScore,
+      operationsScore,
+      overallScore,
+      riskLevel,
+      ...levels,
+      pullOutGuidance: buildExitGuidance(rsi14, relativeVolume, changePercent),
+      rationale: buildRationale({
+        ticker,
+        sentimentScore,
+        technicalScore,
+        volumeScore,
+        momentumScore,
+        operationsScore,
+        relativeVolume,
+        changePercent,
+        tags
+      }),
+      catalystTags: tags.length ? tags : ["Liquidity scan", "Technical watch"],
+      factors,
+      robinhoodUrl: robinhoodStockUrl(ticker),
+      sources: ["FMP quote", "FMP historical prices", "FMP stock news", hasAlphaVantageKey() ? "Alpha Vantage sentiment" : "Keyword sentiment"]
+    };
+
+    return { pick };
+  } catch (error) {
+    return { error: `${ticker}: ${error instanceof Error ? error.message : "unknown error"}` };
+  }
+}
+
+function averageVolume(bars: Array<{ volume?: number }>) {
+  const volumes = bars.map((bar) => Number(bar.volume)).filter((value) => Number.isFinite(value) && value > 0).slice(-30);
+  if (!volumes.length) return 0;
+  return volumes.reduce((sum, value) => sum + value, 0) / volumes.length;
+}
+
+function scoreOperations(texts: string[]) {
+  const tags = catalystTagsFromText(texts);
+  if (!texts.length) return 45;
+  if (tags.includes("Regulatory/legal")) return 48;
+  if (tags.length >= 2) return 72;
+  if (tags.length === 1) return 62;
+  return 50;
+}
+
+function technicalReason(rsi?: number) {
+  if (!rsi) return "Not enough closing price history to calculate RSI.";
+  if (rsi >= 45 && rsi <= 68) return "RSI is in a constructive momentum zone without being extremely overbought.";
+  if (rsi > 75) return "RSI is stretched; the stock may be overextended for a fresh entry.";
+  if (rsi < 35) return "RSI is weak; momentum may be damaged unless a reversal confirms.";
+  return "RSI is mixed and needs confirmation from price and volume.";
+}
+
+function volumeReason(relativeVolume?: number) {
+  if (!relativeVolume) return "Average volume comparison could not be calculated.";
+  if (relativeVolume >= 1.5) return "Trading activity is meaningfully above normal, which can support intraday movement.";
+  if (relativeVolume < 0.8) return "Volume is below normal, which can make breakouts less reliable.";
+  return "Volume is near normal and needs confirmation before sizing up.";
+}
+
+function momentumReason(changePercent: number) {
+  if (changePercent > 9) return "Price has already moved sharply; this raises reversal and chase risk.";
+  if (changePercent >= 0.75) return "Positive price movement suggests active buyer interest today.";
+  if (changePercent < -0.75) return "Negative daily movement weakens the long-side day trade setup.";
+  return "Price movement is modest and may require a breakout before action.";
+}
+
+function operationsReason(score: number) {
+  if (score >= 62) return "Recent headlines show an identifiable company, sector, analyst, earnings, or product catalyst.";
+  if (score <= 42) return "News flow appears weak or negative; catalyst quality is not supportive.";
+  return "No strong company-specific catalyst detected from current headlines.";
+}
+
+function buildExitGuidance(rsi?: number, relativeVolume?: number, changePercent?: number) {
+  if ((rsi ?? 0) > 75 || (changePercent ?? 0) > 8) {
+    return "Protect gains quickly. Pull out if price rejects near the high of day, loses VWAP, or prints two lower five-minute closes on rising sell volume.";
+  }
+  if ((relativeVolume ?? 0) < 1) {
+    return "Do not force the trade. Pull out if volume stays below average or the move cannot hold above the entry range after the first 30–45 minutes.";
+  }
+  return "Pull out if price loses VWAP, breaks the lower entry range on heavy volume, or the news/sector catalyst fades before reaching target.";
+}
+
+function buildRationale(input: {
+  ticker: string;
+  sentimentScore: number;
+  technicalScore: number;
+  volumeScore: number;
+  momentumScore: number;
+  operationsScore: number;
+  relativeVolume?: number;
+  changePercent: number;
+  tags: string[];
+}) {
+  const strongest = [
+    ["news sentiment", input.sentimentScore],
+    ["technicals", input.technicalScore],
+    ["volume", input.volumeScore],
+    ["momentum", input.momentumScore],
+    ["operations/news", input.operationsScore]
+  ].sort((a, b) => Number(b[1]) - Number(a[1]))[0][0];
+
+  const catalyst = input.tags.length ? ` Catalyst tags: ${input.tags.join(", ")}.` : "";
+  return `${input.ticker} ranks well because ${strongest} is currently the strongest influence in the model, with ${input.relativeVolume ? `${input.relativeVolume}x relative volume` : "volume data under review"} and ${input.changePercent.toFixed(2)}% price movement today.${catalyst} This is a research signal, not a buy instruction.`;
+}
+
+function marketSessionLabel() {
+  const now = new Date();
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour: "numeric",
+    minute: "numeric",
+    weekday: "short"
+  });
+  return `Generated ${formatter.format(now)} ET`;
+}
