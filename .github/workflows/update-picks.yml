@@ -15,15 +15,13 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # This opts GitHub Actions into Node.js 24 now.
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
-      # These values come from GitHub Secrets / Variables.
-      # Do not paste real API keys directly into this file.
       FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
       ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
       TRADE_TICKERS: ${{ vars.TRADE_TICKERS }}
+      MAX_SCAN_TICKERS: ${{ vars.MAX_SCAN_TICKERS }}
       NETLIFY_BUILD_HOOK_URL: ${{ secrets.NETLIFY_BUILD_HOOK_URL }}
+      BUILD_ROBINHOOD_UNIVERSE: ${{ vars.BUILD_ROBINHOOD_UNIVERSE }}
 
     steps:
       - name: Checkout repository
@@ -39,6 +37,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
+      - name: Build Robinhood-compatible ticker universe
+        if: ${{ env.BUILD_ROBINHOOD_UNIVERSE == 'true' }}
+        run: |
+          python scripts/build_robinhood_universe.py
+
       - name: Generate latest research picks
         run: |
           python scripts/update_picks.py
@@ -47,7 +50,7 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
-          git add data/latest-picks.json
+          git add data/latest-picks.json data/robinhood-universe.json
           git diff --cached --quiet || git commit -m "Update daily research picks"
           git push
 
