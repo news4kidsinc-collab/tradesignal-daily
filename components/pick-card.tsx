@@ -5,6 +5,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { CopyTickerButton } from "@/components/copy-ticker-button";
+import { FavoriteTickerButton } from "@/components/favorite-ticker-button";
 
 export function PickCard({ pick }: { pick: TradePick }) {
   const isPositive = pick.changePercent >= 0;
@@ -21,7 +22,10 @@ export function PickCard({ pick }: { pick: TradePick }) {
             </div>
             <p className="mt-1 text-sm text-muted-foreground">{pick.companyName}</p>
           </div>
-          <CopyTickerButton ticker={pick.ticker} />
+          <div className="flex items-center gap-2">
+            <FavoriteTickerButton ticker={pick.ticker} compact />
+            <CopyTickerButton ticker={pick.ticker} />
+          </div>
         </div>
 
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">

@@ -1,5 +1,5 @@
 import latestSnapshot from "@/data/latest-picks.json";
-import type { InfluenceFactor, PicksSnapshot, TradePick } from "@/types/market";
+import type { DataProvider, InfluenceFactor, PicksSnapshot, TradePick } from "@/types/market";
 import { getUniverseFromEnv } from "@/lib/market/config";
 import {
   buildTradeLevels,
@@ -16,6 +16,7 @@ import {
 } from "@/lib/market/scoring";
 import { alphaSentimentToScore, getAlphaNewsSentiment, hasAlphaVantageKey } from "@/lib/market/providers/alpha-vantage";
 import { getFmpHistorical, getFmpNews, getFmpProfile, getFmpQuote, hasFmpKey } from "@/lib/market/providers/fmp";
+import { getFinnhubCandles, getFinnhubCompanyNews, getFinnhubProfile, getFinnhubQuote, hasFinnhubKey } from "@/lib/market/providers/finnhub";
 import { robinhoodStockUrl } from "@/lib/utils";
 
 const typedFallback = latestSnapshot as PicksSnapshot;
@@ -25,26 +26,67 @@ type BuildPickResult = {
   error?: string;
 };
 
-export async function getDailyResearchPicks(refresh = false): Promise<PicksSnapshot> {
-  const universe = getUniverseFromEnv();
+type ResearchProvider = "fmp" | "finnhub";
 
-  if (!hasFmpKey()) {
+type ResearchOptions = {
+  refresh?: boolean;
+  provider?: DataProvider;
+  symbols?: string[];
+};
+
+const FMP_MANUAL_SCAN_LIMIT = 3;
+const FINNHUB_MANUAL_SCAN_LIMIT = 5;
+
+export async function getDailyResearchPicks(options: ResearchOptions = {}): Promise<PicksSnapshot> {
+  const provider = resolveProvider(options.provider);
+  const manualSymbols = sanitizeSymbols(options.symbols ?? []);
+  const manualLimit = provider === "finnhub" ? FINNHUB_MANUAL_SCAN_LIMIT : FMP_MANUAL_SCAN_LIMIT;
+  const universe = manualSymbols.length ? manualSymbols.slice(0, manualLimit) : getUniverseFromEnv();
+  const refresh = Boolean(options.refresh);
+
+  if (!hasProviderKey(provider)) {
+    const fallbackCandidates = typedFallback.candidates ?? typedFallback.picks;
     return {
       ...typedFallback,
+      candidates: fallbackCandidates,
       dataStatus: "fallback",
       dataDelayNote:
-        "Fallback sample shown because FMP_API_KEY is missing. Add .env.local and Netlify environment variables to pull real daily data.",
-      providerNote: "No server-side market API key detected. This is not live data."
+        provider === "finnhub"
+          ? "Fallback sample shown because FINNHUB_API_KEY is missing. Add it locally, in GitHub Secrets, and in Netlify environment variables to use Finnhub scans."
+          : "Fallback sample shown because FMP_API_KEY is missing. Add .env.local and Netlify environment variables to pull real daily data.",
+      providerNote: provider === "finnhub" ? "No FINNHUB_API_KEY detected. This is not live Finnhub data." : "No server-side FMP market API key detected. This is not live data.",
+      researchNote:
+        "Use the manual symbol scanner to choose exactly which tickers to analyze. FMP/manual Alpha mode is capped at 3 symbols; Finnhub mode is capped at 5 symbols to reduce rate-limit failures.",
+      providerMode: provider,
+      manualSymbols: universe,
+      manualScanLimit: manualLimit
     };
   }
 
-  const results = await Promise.all(universe.map((ticker) => buildPick(ticker, refresh)));
-  const picks = results
+  const builder: (ticker: string, refresh: boolean) => Promise<BuildPickResult> = provider === "finnhub" ? buildFinnhubPick : buildFmpPick;
+  const results: BuildPickResult[] = await Promise.all(universe.map((ticker: string) => builder(ticker, refresh)));
+  const rankedCandidates = results
     .filter((result): result is { pick: TradePick } => Boolean(result.pick))
     .map((result) => result.pick)
     .sort((a, b) => b.overallScore - a.overallScore)
+    .map((pick, index) => ({
+      ...pick,
+      rank: index + 1,
+      selected: index < 5,
+      selectionNote:
+        index < 5
+          ? `Selected because it ranked #${index + 1} out of the scanned universe by weighted factor score.`
+          : buildMissedTopFiveReason(pick, index + 1)
+    }));
+
+  const picks = rankedCandidates
     .slice(0, 5)
-    .map((pick, index) => ({ ...pick, rank: index + 1 }));
+    .map((pick, index) => ({
+      ...pick,
+      rank: index + 1,
+      selected: true,
+      selectionNote: `Selected because it ranked #${index + 1} out of ${rankedCandidates.length} analyzed candidates.`
+    }));
 
   const errors = results.map((result) => result.error).filter(Boolean) as string[];
 
@@ -54,6 +96,7 @@ export async function getDailyResearchPicks(refresh = false): Promise<PicksSnaps
       dataStatus: "error",
       dataDelayNote: "Live provider calls failed; fallback sample data is displayed.",
       providerNote: "Check API keys, endpoint access, and provider limits.",
+      candidates: typedFallback.candidates ?? typedFallback.picks,
       errors
     };
   }
@@ -64,16 +107,51 @@ export async function getDailyResearchPicks(refresh = false): Promise<PicksSnaps
     dataStatus: "live",
     dataDelayNote:
       "Server-side API data loaded. Depending on your data plan, quotes may be real-time, near real-time, or delayed by the provider.",
-    providerNote: hasAlphaVantageKey()
-      ? "Using FMP for quote/history/profile/news and Alpha Vantage for optional news sentiment overlay."
-      : "Using FMP for quote/history/profile/news. Add ALPHA_VANTAGE_API_KEY for an external sentiment overlay.",
+    providerNote: provider === "finnhub"
+      ? (hasAlphaVantageKey()
+        ? "Using Finnhub for quote/daily candles/profile/news and Alpha Vantage for optional news sentiment overlay."
+        : "Using Finnhub for quote/daily candles/profile/news. Add ALPHA_VANTAGE_API_KEY only if you want an external sentiment overlay.")
+      : (hasAlphaVantageKey()
+        ? "Using FMP for quote/history/profile/news and Alpha Vantage for optional news sentiment overlay."
+        : "Using FMP for quote/history/profile/news. Add ALPHA_VANTAGE_API_KEY for an external sentiment overlay."),
+    researchNote:
+      manualSymbols.length
+        ? `Manual scan completed for ${universe.length} selected symbol${universe.length === 1 ? "" : "s"}. ${provider === "finnhub" ? "Finnhub mode allows up to 5 selected symbols." : "FMP/Alpha mode allows up to 3 selected symbols."}`
+        : "Top 5 recommendations may repeat when the same symbols keep scoring highest. Use the Full Scan view to inspect every ticker scanned, compare factor scores, and see why each symbol was or was not selected.",
     universe,
     picks,
-    errors
+    candidates: rankedCandidates,
+    errors,
+    providerMode: provider,
+    manualSymbols: manualSymbols.length ? universe : undefined,
+    manualScanLimit: manualLimit
   };
 }
 
-async function buildPick(ticker: string, _refresh: boolean): Promise<BuildPickResult> {
+function sanitizeSymbols(symbols: string[]) {
+  const seen = new Set<string>();
+  return symbols
+    .map((symbol) => symbol.trim().toUpperCase())
+    .filter((symbol) => /^[A-Z][A-Z0-9.-]{0,9}$/.test(symbol))
+    .filter((symbol) => {
+      if (seen.has(symbol)) return false;
+      seen.add(symbol);
+      return true;
+    });
+}
+
+function resolveProvider(provider: DataProvider | undefined): ResearchProvider {
+  if (provider === "finnhub") return "finnhub";
+  if (provider === "fmp") return "fmp";
+  if (hasFinnhubKey()) return "finnhub";
+  return "fmp";
+}
+
+function hasProviderKey(provider: ResearchProvider) {
+  return provider === "finnhub" ? hasFinnhubKey() : hasFmpKey();
+}
+
+async function buildFmpPick(ticker: string, _refresh: boolean): Promise<BuildPickResult> {
   try {
     const [quote, profile, historical, news] = await Promise.all([
       getFmpQuote(ticker),
@@ -210,6 +288,165 @@ async function buildPick(ticker: string, _refresh: boolean): Promise<BuildPickRe
   } catch (error) {
     return { error: `${ticker}: ${error instanceof Error ? error.message : "unknown error"}` };
   }
+}
+
+
+async function buildFinnhubPick(ticker: string, _refresh: boolean): Promise<BuildPickResult> {
+  try {
+    const [quote, profile, candles, news] = await Promise.all([
+      getFinnhubQuote(ticker),
+      getFinnhubProfile(ticker).catch(() => undefined),
+      getFinnhubCandles(ticker, 75).catch(() => undefined),
+      getFinnhubCompanyNews(ticker).catch(() => [])
+    ]);
+
+    if (!quote?.c) return { error: `${ticker}: missing Finnhub quote price` };
+
+    const orderedHistorical = candlesToBars(candles);
+    const closes = orderedHistorical.map((bar) => Number(bar.close)).filter(Number.isFinite);
+    const rsi14 = calculateRsi(closes);
+
+    const newsText = news.map((item) => `${item.headline ?? ""} ${item.summary ?? ""}`);
+    let sentimentScore = keywordSentimentScore(newsText);
+    const alphaResponse = hasAlphaVantageKey() ? await getAlphaNewsSentiment(ticker).catch(() => undefined) : undefined;
+    const alphaScore = alphaSentimentToScore(ticker, alphaResponse);
+    if (alphaScore !== undefined) {
+      sentimentScore = Math.round((sentimentScore + alphaScore) / 2);
+    }
+
+    const price = Number(quote.c);
+    const changePercent = Number(quote.dp ?? 0);
+    const avgVolume = averageVolume(orderedHistorical);
+    const volume = Number(orderedHistorical.at(-1)?.volume ?? 0);
+    const relativeVolume = avgVolume > 0 ? Number((volume / avgVolume).toFixed(2)) : undefined;
+    const technicalScore = scoreRsi(rsi14);
+    const momentumScore = scoreMomentum(changePercent);
+    const volumeScore = scoreRelativeVolume(relativeVolume);
+    const operationsScore = scoreOperations(newsText);
+
+    const factors: InfluenceFactor[] = [
+      {
+        name: "News sentiment",
+        value: `${sentimentScore}/100`,
+        score: sentimentScore,
+        weight: weightForFactor("newsSentiment"),
+        direction: scoreDirection(sentimentScore),
+        reason:
+          alphaScore !== undefined
+            ? "Finnhub headline keyword tone blended with Alpha Vantage ticker sentiment."
+            : "Headline keyword tone from recent Finnhub company news because Alpha Vantage key is not enabled.",
+        source: alphaScore !== undefined ? "Finnhub company news + Alpha Vantage NEWS_SENTIMENT" : "Finnhub company news"
+      },
+      {
+        name: "Technical setup",
+        value: rsi14 ? `RSI ${rsi14.toFixed(1)}` : "RSI unavailable",
+        score: technicalScore,
+        weight: weightForFactor("technicals"),
+        direction: scoreDirection(technicalScore),
+        reason: technicalReason(rsi14),
+        source: "Finnhub daily candles"
+      },
+      {
+        name: "Volume pressure",
+        value: relativeVolume ? `${relativeVolume}x average` : "Volume unavailable",
+        score: volumeScore,
+        weight: weightForFactor("volume"),
+        direction: scoreDirection(volumeScore),
+        reason: relativeVolume ? volumeReason(relativeVolume) : "Finnhub quote does not include intraday volume in this endpoint, so the model uses latest daily candle volume when available.",
+        source: "Finnhub daily candles"
+      },
+      {
+        name: "Price momentum",
+        value: `${changePercent.toFixed(2)}% today`,
+        score: momentumScore,
+        weight: weightForFactor("momentum"),
+        direction: scoreDirection(momentumScore),
+        reason: momentumReason(changePercent),
+        source: "Finnhub quote"
+      },
+      {
+        name: "Operations/news catalyst",
+        value: catalystTagsFromText(newsText).join(", ") || "No clear catalyst",
+        score: operationsScore,
+        weight: weightForFactor("operations"),
+        direction: scoreDirection(operationsScore),
+        reason: operationsReason(operationsScore),
+        source: "Finnhub company news"
+      }
+    ];
+
+    const overallScore = weightedOverall(factors);
+    const levels = buildTradeLevels(price, quote.l, quote.h);
+    const riskLevel = riskFromScore(overallScore, price, relativeVolume);
+    const tags = catalystTagsFromText(newsText);
+
+    const pick: TradePick = {
+      rank: 999,
+      ticker,
+      companyName: profile?.name ?? ticker,
+      sector: profile?.finnhubIndustry ?? "Market",
+      price,
+      changePercent,
+      dayHigh: quote.h,
+      dayLow: quote.l,
+      open: quote.o,
+      previousClose: quote.pc,
+      volume,
+      avgVolume,
+      relativeVolume,
+      rsi14,
+      vwap: undefined,
+      sentimentScore,
+      momentumScore,
+      volumeScore,
+      technicalScore,
+      operationsScore,
+      overallScore,
+      riskLevel,
+      ...levels,
+      pullOutGuidance: buildExitGuidance(rsi14, relativeVolume, changePercent),
+      rationale: buildRationale({
+        ticker,
+        sentimentScore,
+        technicalScore,
+        volumeScore,
+        momentumScore,
+        operationsScore,
+        relativeVolume,
+        changePercent,
+        tags
+      }),
+      catalystTags: tags.length ? tags : ["Liquidity scan", "Technical watch"],
+      factors,
+      robinhoodUrl: robinhoodStockUrl(ticker),
+      sources: ["Finnhub quote", "Finnhub daily candles", "Finnhub company news", hasAlphaVantageKey() ? "Alpha Vantage sentiment" : "Keyword sentiment"]
+    };
+
+    return { pick };
+  } catch (error) {
+    return { error: `${ticker}: ${error instanceof Error ? error.message : "unknown Finnhub error"}` };
+  }
+}
+
+function candlesToBars(candles?: { c?: number[]; h?: number[]; l?: number[]; o?: number[]; t?: number[]; v?: number[]; s?: string }) {
+  if (!candles || candles.s === "no_data" || !Array.isArray(candles.c)) return [];
+  return candles.c
+    .map((close, index) => ({
+      date: candles.t?.[index] ? new Date(Number(candles.t[index]) * 1000).toISOString().slice(0, 10) : String(index),
+      open: candles.o?.[index],
+      high: candles.h?.[index],
+      low: candles.l?.[index],
+      close,
+      volume: candles.v?.[index]
+    }))
+    .filter((bar) => Number.isFinite(Number(bar.close)))
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function buildMissedTopFiveReason(pick: TradePick, rank: number) {
+  const weakest = [...pick.factors].sort((a, b) => a.score - b.score)[0];
+  const strongest = [...pick.factors].sort((a, b) => b.score - a.score)[0];
+  return `Ranked #${rank}. It missed the Top 5 mainly because ${weakest.name.toLowerCase()} scored ${weakest.score}/100 (${weakest.direction}). Strongest factor: ${strongest.name.toLowerCase()} at ${strongest.score}/100.`;
 }
 
 function averageVolume(bars: Array<{ volume?: number }>) {

@@ -10,7 +10,9 @@
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "update:picks": "python3 scripts/update_picks.py",
-    "analyze:picks": "python3 scripts/update_picks.py"
+    "analyze:picks": "python3 scripts/update_picks.py",
+    "update:universe": "python3 scripts/build_robinhood_universe.py",
+    "update:all": "python3 scripts/build_robinhood_universe.py && python3 scripts/update_picks.py"
   },
   "dependencies": {
     "@netlify/functions": "^2.8.2",

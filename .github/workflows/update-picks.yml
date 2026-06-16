@@ -3,6 +3,8 @@ name: Update Daily Research Picks
 on:
   workflow_dispatch:
   schedule:
+    # Runs Monday-Friday at 8:00 AM Eastern approximation.
+    # GitHub cron uses UTC.
     - cron: "0 13 * * 1-5"
 
 permissions:
@@ -15,7 +17,9 @@ jobs:
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+      FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
       ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
+      DATA_PROVIDER: ${{ vars.DATA_PROVIDER }}
       TRADE_TICKERS: ${{ vars.TRADE_TICKERS }}
       MAX_SCAN_TICKERS: ${{ vars.MAX_SCAN_TICKERS }}
       BUILD_ROBINHOOD_UNIVERSE: ${{ vars.BUILD_ROBINHOOD_UNIVERSE }}
@@ -38,13 +42,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
+      - name: Build Robinhood-compatible ticker universe
+        if: ${{ env.BUILD_ROBINHOOD_UNIVERSE == 'true' }}
+        run: |
+          python scripts/build_robinhood_universe.py
+
       - name: Generate latest research picks
         run: |
           python scripts/update_picks.py
 
       - name: Check generated files
         run: |
-          echo "Checking generated data files..."
+          echo "Generated data files:"
           ls -la data || true
           git status --short
 
