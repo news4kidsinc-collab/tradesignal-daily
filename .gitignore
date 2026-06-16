@@ -32,3 +32,5 @@ pnpm-debug.log*
 
 # netlify
 .netlify
+tsconfig.tsbuildinfo
+*.tsbuildinfo
