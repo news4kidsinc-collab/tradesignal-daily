@@ -3,8 +3,6 @@ name: Update Daily Research Picks
 on:
   workflow_dispatch:
   schedule:
-    # Runs Monday-Friday at 8:00 AM Eastern approximation.
-    # GitHub cron uses UTC.
     - cron: "0 13 * * 1-5"
 
 permissions:
@@ -20,12 +18,15 @@ jobs:
       ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
       TRADE_TICKERS: ${{ vars.TRADE_TICKERS }}
       MAX_SCAN_TICKERS: ${{ vars.MAX_SCAN_TICKERS }}
-      NETLIFY_BUILD_HOOK_URL: ${{ secrets.NETLIFY_BUILD_HOOK_URL }}
       BUILD_ROBINHOOD_UNIVERSE: ${{ vars.BUILD_ROBINHOOD_UNIVERSE }}
+      NETLIFY_BUILD_HOOK_URL: ${{ secrets.NETLIFY_BUILD_HOOK_URL }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -37,22 +38,36 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Build Robinhood-compatible ticker universe
-        if: ${{ env.BUILD_ROBINHOOD_UNIVERSE == 'true' }}
-        run: |
-          python scripts/build_robinhood_universe.py
-
       - name: Generate latest research picks
         run: |
           python scripts/update_picks.py
+
+      - name: Check generated file
+        run: |
+          ls -la data/latest-picks.json
+          git status --short
 
       - name: Commit updated picks
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
+
           git add data/latest-picks.json data/robinhood-universe.json
-          git diff --cached --quiet || git commit -m "Update daily research picks"
-          git push
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update daily research picks"
+
+      - name: Pull latest branch changes
+        run: |
+          git pull --rebase origin main
+
+      - name: Push updated picks
+        run: |
+          git push origin main
 
       - name: Trigger Netlify rebuild
         if: ${{ env.NETLIFY_BUILD_HOOK_URL != '' }}
