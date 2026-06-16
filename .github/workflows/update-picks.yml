@@ -42,20 +42,31 @@ jobs:
         run: |
           python scripts/update_picks.py
 
-      - name: Check generated file
+      - name: Check generated files
         run: |
-          ls -la data/latest-picks.json
+          echo "Checking generated data files..."
+          ls -la data || true
           git status --short
 
-      - name: Commit updated picks
+      - name: Commit updated research files
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
-          git add data/latest-picks.json data/robinhood-universe.json
+          if [ -f "data/latest-picks.json" ]; then
+            git add data/latest-picks.json
+          fi
+
+          if [ -f "data/robinhood-universe.json" ]; then
+            git add data/robinhood-universe.json
+          fi
+
+          if [ -f "data/ticker-universe.ts" ]; then
+            git add data/ticker-universe.ts
+          fi
 
           if git diff --cached --quiet; then
-            echo "No changes to commit."
+            echo "No generated data changes to commit."
             exit 0
           fi
 
@@ -65,7 +76,7 @@ jobs:
         run: |
           git pull --rebase origin main
 
-      - name: Push updated picks
+      - name: Push updated research files
         run: |
           git push origin main
 
